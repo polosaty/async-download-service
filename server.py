@@ -9,7 +9,7 @@ from subprocess import PIPE
 import aiofiles
 from aiohttp import web
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", logging.INFO))
 
 INTERVAL_SECS = 1  # sec
 BATCH_SIZE = 100  # KiB
@@ -18,6 +18,12 @@ PHOTOS_DIR = os.getenv("PHOTOS_DIR", "test_photos")
 PAGE_404 = "/404"
 DELAY = os.getenv("DELAY", 0)  # sec
 PORT = os.getenv("PORT", 8080)
+
+
+async def kill_process(process):
+    if process and process.returncode is None:
+        process.kill()
+        await process.communicate()
 
 
 async def archivate(request: web.BaseRequest):
@@ -38,9 +44,9 @@ async def archivate(request: web.BaseRequest):
         return response
 
     elif archive_hash in DIRECTORIES:
-        directory = os.path.join(PHOTOS_DIR, DIRECTORIES[archive_hash])
-        files = [f for f in os.listdir(directory)]
-        tell = 0
+        directory = os.path.join(request.app['photos_dir'], DIRECTORIES[archive_hash])
+        files = [file for file in os.listdir(directory)]
+        archive_offset = 0
         process = await asyncio.create_subprocess_exec(
             "zip", "-", *files, stdout=PIPE, stderr=PIPE, cwd=directory
         )
@@ -54,21 +60,20 @@ async def archivate(request: web.BaseRequest):
             await response.prepare(request)
 
             while not process.stdout.at_eof():
-                logging.debug("Sending archive chunk with offset: %r", tell)
+                logging.debug("Sending archive chunk with offset: %r", archive_offset)
                 buf = await process.stdout.read(BATCH_SIZE * 1024)
-                tell += len(buf)
+                archive_offset += len(buf)
                 await response.write(buf)
 
-                if DELAY:
-                    await asyncio.sleep(DELAY)
+                if request.app.get('delay'):
+                    await asyncio.sleep(request.app.get('delay'))
             return response
         except asyncio.CancelledError:
             logging.debug("Download was interrupted")
-            process.kill()
+            await kill_process(process)
+            raise
         finally:
-            if process.returncode is None:
-                process.kill()
-                await process.communicate()
+            await kill_process(process)
             logging.debug("Archive sending finished")
 
     else:
@@ -103,16 +108,13 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    if args.photos_dir:
-        globals()["PHOTOS_DIR"] = args.photos_dir
-
-    if args.delay:
-        globals()["DELAY"] = args.delay
-
     app = web.Application()
 
-    for d in os.listdir(PHOTOS_DIR):
-        DIRECTORIES[hashlib.md5(d.encode()).hexdigest()] = d
+    app['photos_dir'] = args.photos_dir or PHOTOS_DIR
+    app['delay'] = args.delay or DELAY
+
+    for directory_name in os.listdir(PHOTOS_DIR):
+        DIRECTORIES[hashlib.md5(directory_name.encode()).hexdigest()] = directory_name
 
     logging.debug("photo rirectories %r", DIRECTORIES)
 
